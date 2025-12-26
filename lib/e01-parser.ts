@@ -7,6 +7,8 @@
  * - Each section has: type (16 bytes), next offset (8 bytes), size (8 bytes), checksum (4 bytes)
  */
 
+import pako from 'pako';
+
 // EWF signature bytes
 const EWF_SIGNATURE = new Uint8Array([0x45, 0x56, 0x46, 0x09, 0x0d, 0x0a, 0xff, 0x00]);
 
@@ -116,6 +118,30 @@ function readUint32LE(data: Uint8Array, offset: number): number {
 }
 
 /**
+ * Try to decode text from bytes, handling UTF-16 and UTF-8
+ */
+function decodeText(data: Uint8Array): string {
+  // Check for UTF-16 BOM or if it looks like UTF-16 (alternating null bytes)
+  if (data.length >= 2) {
+    // UTF-16 LE BOM
+    if (data[0] === 0xff && data[1] === 0xfe) {
+      return new TextDecoder('utf-16le').decode(data);
+    }
+    // UTF-16 BE BOM
+    if (data[0] === 0xfe && data[1] === 0xff) {
+      return new TextDecoder('utf-16be').decode(data);
+    }
+    // Check for UTF-16 LE pattern (ASCII char followed by null)
+    if (data[1] === 0x00 && data[0] !== 0x00) {
+      return new TextDecoder('utf-16le').decode(data);
+    }
+  }
+
+  // Default to UTF-8
+  return new TextDecoder('utf-8', { fatal: false }).decode(data);
+}
+
+/**
  * Parse the header section to extract metadata
  * Header is typically zlib compressed and contains key-value pairs
  */
@@ -123,21 +149,17 @@ function parseHeaderSection(sectionData: Uint8Array): E01Metadata {
   const metadata: E01Metadata = {};
 
   try {
-    // Try to decompress with pako if available, otherwise try raw
-    let decompressed: Uint8Array | null = null;
+    // Try to decompress - E01 headers are usually zlib compressed
+    let decompressed: Uint8Array;
 
-    // Check if data looks compressed (zlib header: 0x78)
-    if (sectionData.length > 2 && sectionData[0] === 0x78) {
-      // Try browser's DecompressionStream if available
-      try {
-        decompressed = decompressZlib(sectionData);
-      } catch {
-        // Fall through to try raw
-      }
+    try {
+      decompressed = decompressZlib(sectionData);
+    } catch {
+      decompressed = sectionData;
     }
 
-    const textData = decompressed || sectionData;
-    const text = new TextDecoder('utf-8', { fatal: false }).decode(textData);
+    // Decode text (handles UTF-8 and UTF-16)
+    const text = decodeText(decompressed);
 
     // Parse the header format: lines of key=value or key\tvalue
     // Common format: category\nkey\tvalue\nkey\tvalue\n\n
@@ -155,7 +177,7 @@ function parseHeaderSection(sectionData: Uint8Array): E01Metadata {
         const key = parts[0].trim().toLowerCase();
         const value = parts.slice(1).join('=').trim();
 
-        // Map common keys
+        // Map common keys (EWF uses single letter codes)
         switch (key) {
           case 'c': case 'case': case 'case_number':
             metadata.caseNumber = value;
@@ -169,16 +191,16 @@ function parseHeaderSection(sectionData: Uint8Array): E01Metadata {
           case 'ev': case 'evidence': case 'evidence_number':
             metadata.evidenceNumber = value;
             break;
-          case 'no': case 'notes':
+          case 't': case 'notes':
             metadata.notes = value;
             break;
-          case 'a': case 'acquired': case 'acquired_date':
+          case 'a': case 'acquired': case 'acquired_date': case 'av':
             metadata.acquiredDate = value;
             break;
-          case 'm': case 'system': case 'system_date':
+          case 'm': case 'system': case 'system_date': case 'ov':
             metadata.systemDate = value;
             break;
-          case 'os': case 'operating_system':
+          case 'u': case 'os': case 'operating_system':
             metadata.operatingSystem = value;
             break;
           case 'p': case 'password':
@@ -187,8 +209,21 @@ function parseHeaderSection(sectionData: Uint8Array): E01Metadata {
           case 'r': case 'compression':
             metadata.compressionLevel = value;
             break;
+          case 'pid': case 'process_identifier':
+            metadata.processIdentifier = value;
+            break;
+          case 'dc': case 'unknown_dc':
+            metadata.unknownDc = value;
+            break;
+          case 'ext': case 'extents':
+            metadata.extents = value;
+            break;
+          case 'sr': case 'sn':
+            metadata.serialNumber = value;
+            break;
           default:
-            if (key && value) {
+            // Store any other key-value pairs
+            if (key && value && key.length < 20) {
               metadata[key] = value;
             }
         }
@@ -202,34 +237,20 @@ function parseHeaderSection(sectionData: Uint8Array): E01Metadata {
 }
 
 /**
- * Basic zlib decompression using browser APIs or manual inflate
+ * Decompress zlib data using pako
  */
 function decompressZlib(data: Uint8Array): Uint8Array {
-  // Skip zlib header (2 bytes) and checksum (4 bytes at end)
-  // Use raw deflate data
-  const deflateData = data.slice(2, -4);
-
-  // Simple inflate implementation for basic cases
-  // For production, you'd want pako or similar
-  return inflateRaw(deflateData);
-}
-
-/**
- * Basic raw inflate implementation
- * Note: This is simplified - for production use pako library
- */
-function inflateRaw(data: Uint8Array): Uint8Array {
-  // For now, return the data as-is if we can't decompress
-  // In a real implementation, we'd use pako or implement full DEFLATE
-
-  // Try to detect if it's already uncompressed text
-  const text = new TextDecoder('utf-8', { fatal: false }).decode(data);
-  if (text.includes('=') || text.includes('\t')) {
-    return data;
+  try {
+    return pako.inflate(data);
+  } catch {
+    // If inflate fails, try raw inflate (without zlib header)
+    try {
+      return pako.inflateRaw(data);
+    } catch {
+      // Return original data if all decompression fails
+      return data;
+    }
   }
-
-  // Return original data
-  return data;
 }
 
 /**
