@@ -494,14 +494,28 @@ export async function parseE01(file: File): Promise<E01ParseResult> {
       // Combine all decompressed chunks into raw disk data
       if (chunks.length > 0) {
         const totalSize = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-        log(`Combining chunks into ${totalSize} bytes of raw disk data...`);
-        result.rawDiskData = new Uint8Array(totalSize);
-        let pos = 0;
-        for (const chunk of chunks) {
-          result.rawDiskData.set(chunk, pos);
-          pos += chunk.length;
+        log(`Total decompressed size: ${totalSize} bytes (${(totalSize / 1024 / 1024).toFixed(1)} MB)`);
+
+        // Check if size is too large for browser memory (limit to 500MB)
+        const MAX_SIZE = 500 * 1024 * 1024; // 500MB limit
+        if (totalSize > MAX_SIZE) {
+          log(`WARNING: Decompressed size ${totalSize} exceeds ${MAX_SIZE} byte limit - skipping full disk load to prevent browser crash`);
+          result.errors.push(`Disk image too large for browser memory (${(totalSize / 1024 / 1024 / 1024).toFixed(2)} GB). Only metadata will be shown.`);
+          // Still provide first chunk for hex viewer preview
+          if (chunks[0]) {
+            result.rawDiskData = chunks[0];
+            log('Loaded first chunk only for preview');
+          }
+        } else {
+          log(`Combining chunks into ${totalSize} bytes of raw disk data...`);
+          result.rawDiskData = new Uint8Array(totalSize);
+          let pos = 0;
+          for (const chunk of chunks) {
+            result.rawDiskData.set(chunk, pos);
+            pos += chunk.length;
+          }
+          log('Raw disk data assembled successfully');
         }
-        log('Raw disk data assembled successfully');
       }
     } else {
       log('No TABLE/SECTORS sections found or no chunk count - cannot decompress');
