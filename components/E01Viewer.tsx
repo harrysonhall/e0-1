@@ -4,6 +4,7 @@ import { useState, useCallback } from 'react';
 import {
   parseE01,
   E01ParseResult,
+  E01DebugInfo,
   hexDump,
   formatBytes,
 } from '@/lib/e01-parser';
@@ -15,32 +16,56 @@ export default function E01Viewer() {
   const [fileSize, setFileSize] = useState<number>(0);
   const [hexOffset, setHexOffset] = useState(0);
   const [activeTab, setActiveTab] = useState<'metadata' | 'sections' | 'hex'>('metadata');
+  const [parseError, setParseError] = useState<string | null>(null);
+  const [debugInfo, setDebugInfo] = useState<E01DebugInfo | null>(null);
+  const [copied, setCopied] = useState(false);
 
-  const handleFileDrop = useCallback(async (e: React.DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    const file = e.dataTransfer.files[0];
-    if (file) {
-      await processFile(file);
-    }
-  }, []);
-
-  const handleFileSelect = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      await processFile(file);
-    }
-  }, []);
-
-  const processFile = async (file: File) => {
+  const processFile = useCallback(async (file: File) => {
     setLoading(true);
     setFileName(file.name);
     setFileSize(file.size);
     setHexOffset(0);
+    setParseError(null);
+    setDebugInfo(null);
+
+    // Create a default debug object for error cases
+    const errorDebug: E01DebugInfo = {
+      fileSize: file.size,
+      parseStartTime: Date.now(),
+      sectionsFound: [],
+      lastOffset: 0,
+      logs: [`File: ${file.name}`, `Size: ${file.size} bytes`],
+    };
 
     try {
+      console.log('[E01Viewer] Starting file processing:', file.name, file.size);
+
       const parseResult = await parseE01(file);
+
+      console.log('[E01Viewer] Parse complete, result:', {
+        valid: parseResult.valid,
+        sections: parseResult.sections.length,
+        errors: parseResult.errors,
+      });
+
       setResult(parseResult);
+      setDebugInfo(parseResult.debug);
+
     } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      const errorStack = error instanceof Error ? error.stack : undefined;
+
+      console.error('[E01Viewer] Critical error during parsing:', error);
+
+      errorDebug.logs.push(`CRITICAL ERROR: ${errorMsg}`);
+      if (errorStack) {
+        errorDebug.logs.push(`Stack: ${errorStack}`);
+      }
+      errorDebug.parseEndTime = Date.now();
+      errorDebug.parseDuration = errorDebug.parseEndTime - errorDebug.parseStartTime;
+
+      setParseError(errorMsg);
+      setDebugInfo(errorDebug);
       setResult({
         valid: false,
         signature: new Uint8Array(8),
@@ -48,16 +73,68 @@ export default function E01Viewer() {
         metadata: {},
         volumeInfo: null,
         rawDiskData: null,
-        errors: [`Failed to parse file: ${error instanceof Error ? error.message : String(error)}`],
+        errors: [`Failed to parse file: ${errorMsg}`],
+        debug: errorDebug,
       });
     }
 
     setLoading(false);
-  };
+  }, []);
 
-  const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
+  const handleFileDrop = useCallback(async (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
-  };
+    e.stopPropagation();
+    const file = e.dataTransfer.files[0];
+    if (file) {
+      await processFile(file);
+    }
+  }, [processFile]);
+
+  const handleFileSelect = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      await processFile(file);
+    }
+  }, [processFile]);
+
+  const handleDragOver = useCallback((e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+  }, []);
+
+  const copyDebugInfo = useCallback(async () => {
+    const info = {
+      timestamp: new Date().toISOString(),
+      fileName,
+      fileSize,
+      userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : 'N/A',
+      parseError,
+      debug: debugInfo,
+      result: result ? {
+        valid: result.valid,
+        sectionsCount: result.sections.length,
+        sectionTypes: result.sections.map(s => s.type),
+        metadataKeys: Object.keys(result.metadata),
+        volumeInfo: result.volumeInfo,
+        hasRawData: !!result.rawDiskData,
+        rawDataSize: result.rawDiskData?.length,
+        errors: result.errors,
+        hash: result.hash,
+      } : null,
+    };
+
+    const debugText = JSON.stringify(info, null, 2);
+
+    try {
+      await navigator.clipboard.writeText(debugText);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // Fallback for browsers without clipboard API
+      console.log('Debug Info:', debugText);
+      alert('Debug info logged to console (clipboard not available)');
+    }
+  }, [fileName, fileSize, parseError, debugInfo, result]);
 
   return (
     <div className="w-full max-w-4xl mx-auto p-4">
@@ -90,6 +167,7 @@ export default function E01Viewer() {
         <div className="text-center py-8">
           <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-500 mx-auto mb-2"></div>
           <p>Parsing E01 file...</p>
+          <p className="text-sm text-gray-500 mt-2">Check browser console for detailed progress</p>
         </div>
       )}
 
@@ -102,10 +180,31 @@ export default function E01Viewer() {
               <span className="font-medium">{fileName}</span>
               <span className="text-gray-500 ml-2">({formatBytes(fileSize)})</span>
             </div>
-            <div className={`px-3 py-1 rounded-full text-sm font-medium ${result.valid ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200' : 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200'}`}>
-              {result.valid ? 'Valid E01' : 'Invalid'}
+            <div className="flex items-center gap-2">
+              <button
+                onClick={copyDebugInfo}
+                className="px-3 py-1 bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 rounded text-sm transition-colors"
+              >
+                {copied ? 'Copied!' : 'Copy Debug Info'}
+              </button>
+              <div className={`px-3 py-1 rounded-full text-sm font-medium ${result.valid ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200' : 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200'}`}>
+                {result.valid ? 'Valid E01' : 'Invalid'}
+              </div>
             </div>
           </div>
+
+          {/* Debug Info Summary */}
+          {debugInfo && (
+            <div className="bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-800 rounded-lg p-4 text-sm">
+              <h3 className="font-medium text-blue-800 dark:text-blue-200 mb-2">Parse Info</h3>
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-blue-700 dark:text-blue-300">
+                <span>Duration: {debugInfo.parseDuration ?? 0}ms</span>
+                <span>Sections: {debugInfo.sectionsFound.length}</span>
+                <span>Last offset: 0x{debugInfo.lastOffset.toString(16)}</span>
+                <span>Logs: {debugInfo.logs.length} entries</span>
+              </div>
+            </div>
+          )}
 
           {/* Errors */}
           {result.errors.length > 0 && (
@@ -250,7 +349,7 @@ export default function E01Viewer() {
                         disabled={hexOffset === 0}
                         className="px-2 py-1 bg-gray-200 dark:bg-gray-700 rounded disabled:opacity-50"
                       >
-                        ← Prev
+                        Prev
                       </button>
                       <span className="text-gray-500">
                         Offset: 0x{hexOffset.toString(16)} / {formatBytes(result.rawDiskData.length)}
@@ -260,7 +359,7 @@ export default function E01Viewer() {
                         disabled={hexOffset >= (result.rawDiskData?.length ?? 0) - 256}
                         className="px-2 py-1 bg-gray-200 dark:bg-gray-700 rounded disabled:opacity-50"
                       >
-                        Next →
+                        Next
                       </button>
                     </div>
                   )}
