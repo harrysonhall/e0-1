@@ -65,6 +65,7 @@ export interface E01DebugInfo {
   parseEndTime?: number;
   parseDuration?: number;
   sectionsFound: string[];
+  chunksProcessed: number;
   lastOffset: number;
   memoryUsage?: number;
   logs: string[];
@@ -314,6 +315,7 @@ export async function parseE01(file: File): Promise<E01ParseResult> {
     fileSize: file.size,
     parseStartTime: Date.now(),
     sectionsFound: [],
+    chunksProcessed: 0,
     lastOffset: 0,
     logs: [],
   };
@@ -337,20 +339,19 @@ export async function parseE01(file: File): Promise<E01ParseResult> {
   try {
     log(`Starting parse of ${file.name} (${file.size} bytes)`);
 
-    // Check file size - warn if very large
     if (file.size > 100 * 1024 * 1024) {
-      log(`Warning: Large file (${(file.size / 1024 / 1024).toFixed(1)} MB) - parsing may be slow`);
+      log(`Warning: Large file (${(file.size / 1024 / 1024).toFixed(1)} MB)`);
     }
 
     log('Reading file into memory...');
     const buffer = await file.arrayBuffer();
-    log(`File read complete, creating Uint8Array...`);
+    log('Creating Uint8Array...');
     const data = new Uint8Array(buffer);
     log(`Buffer created, size: ${data.length}`);
 
     // Check signature
     if (!checkSignature(data)) {
-      log('Invalid EWF signature detected');
+      log('Invalid EWF signature');
       result.errors.push('Invalid EWF signature. This may not be a valid E01 file.');
       debug.parseEndTime = Date.now();
       debug.parseDuration = debug.parseEndTime - debug.parseStartTime;
@@ -363,7 +364,6 @@ export async function parseE01(file: File): Promise<E01ParseResult> {
 
     // Parse sections
     let offset = 13; // After signature + segment number (5 bytes)
-    const dataChunks: Uint8Array[] = [];
     log(`Starting section parsing at offset ${offset}`);
 
     while (offset < data.length - 76) { // Minimum section header size
@@ -380,7 +380,7 @@ export async function parseE01(file: File): Promise<E01ParseResult> {
         break;
       }
 
-      log(`Found section: ${sectionType.toUpperCase()} at offset 0x${offset.toString(16)}, size: ${sectionSize}`);
+      log(`Found section: ${sectionType.toUpperCase()} at 0x${offset.toString(16)}, size: ${sectionSize}`);
       debug.sectionsFound.push(sectionType);
 
       // Calculate data offset (after 76-byte section descriptor)
@@ -407,9 +407,6 @@ export async function parseE01(file: File): Promise<E01ParseResult> {
         result.metadata = { ...result.metadata, ...headerMeta };
       } else if (sectionType === SECTION_TYPES.VOLUME || sectionType === SECTION_TYPES.DISK) {
         result.volumeInfo = parseVolumeSection(sectionData);
-      } else if (sectionType === SECTION_TYPES.SECTORS || sectionType === SECTION_TYPES.DATA) {
-        // Collect disk data chunks
-        dataChunks.push(sectionData);
       } else if (sectionType === SECTION_TYPES.HASH || sectionType === SECTION_TYPES.DIGEST) {
         result.hash = parseHashSection(sectionData);
       } else if (sectionType === SECTION_TYPES.DONE) {
@@ -429,20 +426,85 @@ export async function parseE01(file: File): Promise<E01ParseResult> {
       }
     }
 
-    // Combine data chunks into raw disk data
-    if (dataChunks.length > 0) {
-      log(`Combining ${dataChunks.length} data chunks...`);
-      const totalSize = dataChunks.reduce((sum, chunk) => sum + chunk.length, 0);
-      log(`Total raw data size: ${totalSize} bytes`);
-      result.rawDiskData = new Uint8Array(totalSize);
-      let pos = 0;
-      for (const chunk of dataChunks) {
-        result.rawDiskData.set(chunk, pos);
-        pos += chunk.length;
+    // Decompress disk data using table section
+    log('Looking for TABLE and SECTORS sections for chunk decompression...');
+    const tableSection = result.sections.find(s => s.type === SECTION_TYPES.TABLE);
+    const sectorsSection = result.sections.find(s => s.type === SECTION_TYPES.SECTORS);
+
+    if (tableSection && sectorsSection && result.volumeInfo?.chunkCount) {
+      log(`Found TABLE and SECTORS sections. Chunk count: ${result.volumeInfo.chunkCount}`);
+      const TABLE_ENTRY_START = 24; // Table entries start at byte 24
+      const CHUNK_SIZE = 32768; // 64 sectors × 512 bytes = 32KB per chunk
+
+      const tableData = tableSection.data;
+      const chunkCount = result.volumeInfo.chunkCount;
+      const sectorsStart = sectorsSection.offset; // Section start in file
+      const sectorsSize = Number(sectorsSection.size);
+
+      const chunks: Uint8Array[] = [];
+
+      for (let i = 0; i < chunkCount; i++) {
+        const entryOffset = TABLE_ENTRY_START + (i * 4);
+        if (entryOffset + 4 > tableData.length) break;
+
+        const entry = readUint32LE(tableData, entryOffset);
+        const chunkOffset = entry & 0x7FFFFFFF; // Lower 31 bits = offset
+        const isCompressed = (entry & 0x80000000) !== 0; // MSB = compressed flag
+
+        // Calculate compressed size from next entry
+        let compressedSize: number;
+        if (i + 1 < chunkCount) {
+          const nextEntryOffset = TABLE_ENTRY_START + ((i + 1) * 4);
+          if (nextEntryOffset + 4 <= tableData.length) {
+            const nextEntry = readUint32LE(tableData, nextEntryOffset);
+            compressedSize = (nextEntry & 0x7FFFFFFF) - chunkOffset;
+          } else {
+            compressedSize = sectorsSize - chunkOffset;
+          }
+        } else {
+          compressedSize = sectorsSize - chunkOffset;
+        }
+
+        // Read chunk data from file (offset relative to section start)
+        const absoluteOffset = sectorsStart + chunkOffset;
+        if (absoluteOffset + compressedSize > data.length) break;
+
+        const chunkData = data.slice(absoluteOffset, absoluteOffset + compressedSize);
+
+        // Decompress if needed
+        let decompressed: Uint8Array;
+        if (isCompressed) {
+          try {
+            decompressed = pako.inflate(chunkData);
+          } catch {
+            // If decompression fails, use raw data
+            decompressed = chunkData;
+          }
+        } else {
+          decompressed = chunkData;
+        }
+
+        // Truncate to exactly CHUNK_SIZE bytes (critical for correct disk image)
+        chunks.push(decompressed.slice(0, CHUNK_SIZE));
+        debug.chunksProcessed++;
       }
-      log('Data chunks combined successfully');
+
+      log(`Processed ${chunks.length} chunks`);
+
+      // Combine all decompressed chunks into raw disk data
+      if (chunks.length > 0) {
+        const totalSize = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+        log(`Combining chunks into ${totalSize} bytes of raw disk data...`);
+        result.rawDiskData = new Uint8Array(totalSize);
+        let pos = 0;
+        for (const chunk of chunks) {
+          result.rawDiskData.set(chunk, pos);
+          pos += chunk.length;
+        }
+        log('Raw disk data assembled successfully');
+      }
     } else {
-      log('No data chunks found');
+      log('No TABLE/SECTORS sections found or no chunk count - cannot decompress');
     }
 
     log('Parse complete');
@@ -462,7 +524,6 @@ export async function parseE01(file: File): Promise<E01ParseResult> {
   debug.parseEndTime = Date.now();
   debug.parseDuration = debug.parseEndTime - debug.parseStartTime;
 
-  // Try to get memory usage if available
   if (typeof performance !== 'undefined' && 'memory' in performance) {
     const memory = (performance as unknown as { memory: { usedJSHeapSize: number } }).memory;
     debug.memoryUsage = memory?.usedJSHeapSize;
