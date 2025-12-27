@@ -18,8 +18,21 @@ import { parseFAT, FATParseResult, FATFileEntry, formatFileSize } from '@/lib/fa
 
 type TabType = 'metadata' | 'sections' | 'files' | 'hex';
 
-// Global log storage - persists across renders
-const globalLogs: string[] = [];
+// Global log storage - PERSISTS TO LOCALSTORAGE to survive page reloads
+const STORAGE_KEY = 'e01_debug_logs';
+
+const getStoredLogs = (): string[] => {
+  if (typeof window === 'undefined') return [];
+  try {
+    const stored = localStorage.getItem(STORAGE_KEY);
+    return stored ? JSON.parse(stored) : [];
+  } catch {
+    return [];
+  }
+};
+
+const globalLogs: string[] = typeof window !== 'undefined' ? getStoredLogs() : [];
+
 const addLog = (type: string, ...args: unknown[]) => {
   const timestamp = new Date().toISOString();
   const message = args.map(a => {
@@ -29,9 +42,28 @@ const addLog = (type: string, ...args: unknown[]) => {
     }
     return String(a);
   }).join(' ');
-  globalLogs.push(`[${timestamp}] [${type}] ${message}`);
-  // Keep only last 500 logs
-  if (globalLogs.length > 500) globalLogs.shift();
+  const logEntry = `[${timestamp}] [${type}] ${message}`;
+  globalLogs.push(logEntry);
+
+  // Keep only last 200 logs
+  while (globalLogs.length > 200) globalLogs.shift();
+
+  // IMMEDIATELY persist to localStorage
+  if (typeof window !== 'undefined') {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(globalLogs));
+    } catch {
+      // Storage full or unavailable
+    }
+  }
+};
+
+// Clear logs function
+const clearLogs = () => {
+  globalLogs.length = 0;
+  if (typeof window !== 'undefined') {
+    localStorage.removeItem(STORAGE_KEY);
+  }
 };
 
 interface FileTreeItemProps {
@@ -133,12 +165,19 @@ export default function E01Viewer() {
       addLog('UNHANDLED_REJECTION', event.reason);
     };
 
+    // Capture page unload/reload
+    const beforeUnloadHandler = () => {
+      addLog('PAGE_UNLOAD', 'Page is being unloaded/reloaded!');
+    };
+
     window.addEventListener('error', errorHandler);
     window.addEventListener('unhandledrejection', rejectionHandler);
+    window.addEventListener('beforeunload', beforeUnloadHandler);
 
     return () => {
       window.removeEventListener('error', errorHandler);
       window.removeEventListener('unhandledrejection', rejectionHandler);
+      window.removeEventListener('beforeunload', beforeUnloadHandler);
     };
   }, []);
 
@@ -334,16 +373,33 @@ export default function E01Viewer() {
     }
   }, [lastAction, fileName, fileSize, loading, result, partitionTable]);
 
+  const [logCount, setLogCount] = useState(globalLogs.length);
+
+  // Update log count periodically
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setLogCount(globalLogs.length);
+    }, 500);
+    return () => clearInterval(interval);
+  }, []);
+
   return (
     <>
-      {/* FIXED DEBUG BUTTON - ALWAYS VISIBLE */}
-      <button
-        onClick={copyAllDebugInfo}
-        className="fixed bottom-4 right-4 z-50 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg shadow-lg font-medium text-sm transition-colors"
-        style={{ zIndex: 9999 }}
-      >
-        {copied ? 'Copied!' : 'Copy Debug'}
-      </button>
+      {/* FIXED DEBUG BUTTONS - ALWAYS VISIBLE */}
+      <div className="fixed bottom-4 right-4 z-50 flex flex-col gap-2" style={{ zIndex: 9999 }}>
+        <button
+          onClick={() => { clearLogs(); setLogCount(0); }}
+          className="px-3 py-1 bg-gray-600 hover:bg-gray-700 text-white rounded-lg shadow-lg font-medium text-xs transition-colors"
+        >
+          Clear ({logCount})
+        </button>
+        <button
+          onClick={copyAllDebugInfo}
+          className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg shadow-lg font-medium text-sm transition-colors"
+        >
+          {copied ? 'Copied!' : `Copy Debug (${logCount})`}
+        </button>
+      </div>
 
       <div className="w-full max-w-4xl mx-auto p-4">
         <h1 className="text-3xl font-bold text-center mb-6">E01 Parser</h1>
