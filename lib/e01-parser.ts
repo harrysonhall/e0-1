@@ -59,6 +59,18 @@ export interface E01VolumeInfo {
   reserved?: Uint8Array;
 }
 
+export interface E01DebugInfo {
+  fileSize: number;
+  parseStartTime: number;
+  parseEndTime?: number;
+  parseDuration?: number;
+  sectionsFound: string[];
+  chunksProcessed: number;
+  lastOffset: number;
+  memoryUsage?: number;
+  logs: string[];
+}
+
 export interface E01ParseResult {
   valid: boolean;
   signature: Uint8Array;
@@ -68,6 +80,7 @@ export interface E01ParseResult {
   rawDiskData: Uint8Array | null;
   hash?: { md5?: string; sha1?: string };
   errors: string[];
+  debug: E01DebugInfo;
 }
 
 /**
@@ -298,6 +311,20 @@ function parseHashSection(sectionData: Uint8Array): { md5?: string; sha1?: strin
  * Main parser function
  */
 export async function parseE01(file: File): Promise<E01ParseResult> {
+  const debug: E01DebugInfo = {
+    fileSize: file.size,
+    parseStartTime: Date.now(),
+    sectionsFound: [],
+    chunksProcessed: 0,
+    lastOffset: 0,
+    logs: [],
+  };
+
+  const log = (msg: string) => {
+    debug.logs.push(`[${Date.now() - debug.parseStartTime}ms] ${msg}`);
+    console.log(`[E01 Parser] ${msg}`);
+  };
+
   const result: E01ParseResult = {
     valid: false,
     signature: new Uint8Array(8),
@@ -306,24 +333,38 @@ export async function parseE01(file: File): Promise<E01ParseResult> {
     volumeInfo: null,
     rawDiskData: null,
     errors: [],
+    debug,
   };
 
   try {
+    log(`Starting parse of ${file.name} (${file.size} bytes)`);
+
+    if (file.size > 100 * 1024 * 1024) {
+      log(`Warning: Large file (${(file.size / 1024 / 1024).toFixed(1)} MB)`);
+    }
+
+    log('Reading file into memory...');
     const buffer = await file.arrayBuffer();
+    log('Creating Uint8Array...');
     const data = new Uint8Array(buffer);
+    log(`Buffer created, size: ${data.length}`);
 
     // Check signature
     if (!checkSignature(data)) {
+      log('Invalid EWF signature');
       result.errors.push('Invalid EWF signature. This may not be a valid E01 file.');
+      debug.parseEndTime = Date.now();
+      debug.parseDuration = debug.parseEndTime - debug.parseStartTime;
       return result;
     }
 
+    log('Valid EWF signature found');
     result.signature = data.slice(0, 8);
     result.valid = true;
 
     // Parse sections
     let offset = 13; // After signature + segment number (5 bytes)
-    const dataChunks: Uint8Array[] = [];
+    log(`Starting section parsing at offset ${offset}`);
 
     while (offset < data.length - 76) { // Minimum section header size
       // Read section header
@@ -331,10 +372,16 @@ export async function parseE01(file: File): Promise<E01ParseResult> {
       const nextOffset = readUint64LE(data, offset + 16);
       const sectionSize = readUint64LE(data, offset + 24);
 
+      debug.lastOffset = offset;
+
       // Skip empty or invalid sections
       if (!sectionType || sectionSize === 0n) {
+        log(`Empty/invalid section at offset ${offset}, stopping`);
         break;
       }
+
+      log(`Found section: ${sectionType.toUpperCase()} at 0x${offset.toString(16)}, size: ${sectionSize}`);
+      debug.sectionsFound.push(sectionType);
 
       // Calculate data offset (after 76-byte section descriptor)
       const dataOffset = offset + 76;
@@ -360,9 +407,6 @@ export async function parseE01(file: File): Promise<E01ParseResult> {
         result.metadata = { ...result.metadata, ...headerMeta };
       } else if (sectionType === SECTION_TYPES.VOLUME || sectionType === SECTION_TYPES.DISK) {
         result.volumeInfo = parseVolumeSection(sectionData);
-      } else if (sectionType === SECTION_TYPES.SECTORS || sectionType === SECTION_TYPES.DATA) {
-        // Collect disk data chunks
-        dataChunks.push(sectionData);
       } else if (sectionType === SECTION_TYPES.HASH || sectionType === SECTION_TYPES.DIGEST) {
         result.hash = parseHashSection(sectionData);
       } else if (sectionType === SECTION_TYPES.DONE) {
@@ -382,19 +426,121 @@ export async function parseE01(file: File): Promise<E01ParseResult> {
       }
     }
 
-    // Combine data chunks into raw disk data
-    if (dataChunks.length > 0) {
-      const totalSize = dataChunks.reduce((sum, chunk) => sum + chunk.length, 0);
-      result.rawDiskData = new Uint8Array(totalSize);
-      let pos = 0;
-      for (const chunk of dataChunks) {
-        result.rawDiskData.set(chunk, pos);
-        pos += chunk.length;
+    // Decompress disk data using table section
+    log('Looking for TABLE and SECTORS sections for chunk decompression...');
+    const tableSection = result.sections.find(s => s.type === SECTION_TYPES.TABLE);
+    const sectorsSection = result.sections.find(s => s.type === SECTION_TYPES.SECTORS);
+
+    if (tableSection && sectorsSection && result.volumeInfo?.chunkCount) {
+      log(`Found TABLE and SECTORS sections. Chunk count: ${result.volumeInfo.chunkCount}`);
+      const TABLE_ENTRY_START = 24; // Table entries start at byte 24
+      const CHUNK_SIZE = 32768; // 64 sectors × 512 bytes = 32KB per chunk
+
+      const tableData = tableSection.data;
+      const chunkCount = result.volumeInfo.chunkCount;
+      const sectorsStart = sectorsSection.offset; // Section start in file
+      const sectorsSize = Number(sectorsSection.size);
+
+      const chunks: Uint8Array[] = [];
+
+      for (let i = 0; i < chunkCount; i++) {
+        const entryOffset = TABLE_ENTRY_START + (i * 4);
+        if (entryOffset + 4 > tableData.length) break;
+
+        const entry = readUint32LE(tableData, entryOffset);
+        const chunkOffset = entry & 0x7FFFFFFF; // Lower 31 bits = offset
+        const isCompressed = (entry & 0x80000000) !== 0; // MSB = compressed flag
+
+        // Calculate compressed size from next entry
+        let compressedSize: number;
+        if (i + 1 < chunkCount) {
+          const nextEntryOffset = TABLE_ENTRY_START + ((i + 1) * 4);
+          if (nextEntryOffset + 4 <= tableData.length) {
+            const nextEntry = readUint32LE(tableData, nextEntryOffset);
+            compressedSize = (nextEntry & 0x7FFFFFFF) - chunkOffset;
+          } else {
+            compressedSize = sectorsSize - chunkOffset;
+          }
+        } else {
+          compressedSize = sectorsSize - chunkOffset;
+        }
+
+        // Read chunk data from file (offset relative to section start)
+        const absoluteOffset = sectorsStart + chunkOffset;
+        if (absoluteOffset + compressedSize > data.length) break;
+
+        const chunkData = data.slice(absoluteOffset, absoluteOffset + compressedSize);
+
+        // Decompress if needed
+        let decompressed: Uint8Array;
+        if (isCompressed) {
+          try {
+            decompressed = pako.inflate(chunkData);
+          } catch {
+            // If decompression fails, use raw data
+            decompressed = chunkData;
+          }
+        } else {
+          decompressed = chunkData;
+        }
+
+        // Truncate to exactly CHUNK_SIZE bytes (critical for correct disk image)
+        chunks.push(decompressed.slice(0, CHUNK_SIZE));
+        debug.chunksProcessed++;
       }
+
+      log(`Processed ${chunks.length} chunks`);
+
+      // Combine all decompressed chunks into raw disk data
+      if (chunks.length > 0) {
+        const totalSize = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+        log(`Total decompressed size: ${totalSize} bytes (${(totalSize / 1024 / 1024).toFixed(1)} MB)`);
+
+        // Check if size is too large for browser memory (limit to 500MB)
+        const MAX_SIZE = 500 * 1024 * 1024; // 500MB limit
+        if (totalSize > MAX_SIZE) {
+          log(`WARNING: Decompressed size ${totalSize} exceeds ${MAX_SIZE} byte limit - skipping full disk load to prevent browser crash`);
+          result.errors.push(`Disk image too large for browser memory (${(totalSize / 1024 / 1024 / 1024).toFixed(2)} GB). Only metadata will be shown.`);
+          // Still provide first chunk for hex viewer preview
+          if (chunks[0]) {
+            result.rawDiskData = chunks[0];
+            log('Loaded first chunk only for preview');
+          }
+        } else {
+          log(`Combining chunks into ${totalSize} bytes of raw disk data...`);
+          result.rawDiskData = new Uint8Array(totalSize);
+          let pos = 0;
+          for (const chunk of chunks) {
+            result.rawDiskData.set(chunk, pos);
+            pos += chunk.length;
+          }
+          log('Raw disk data assembled successfully');
+        }
+      }
+    } else {
+      log('No TABLE/SECTORS sections found or no chunk count - cannot decompress');
     }
 
+    log('Parse complete');
+
   } catch (error) {
-    result.errors.push(`Parse error: ${error instanceof Error ? error.message : String(error)}`);
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    const errorStack = error instanceof Error ? error.stack : undefined;
+    debug.logs.push(`ERROR: ${errorMsg}`);
+    if (errorStack) {
+      debug.logs.push(`Stack: ${errorStack}`);
+    }
+    console.error('[E01 Parser] Error:', error);
+    result.errors.push(`Parse error: ${errorMsg}`);
+  }
+
+  // Finalize debug info
+  debug.parseEndTime = Date.now();
+  debug.parseDuration = debug.parseEndTime - debug.parseStartTime;
+
+  if (typeof performance !== 'undefined' && 'memory' in performance) {
+    const memory = (performance as unknown as { memory: { usedJSHeapSize: number } }).memory;
+    debug.memoryUsage = memory?.usedJSHeapSize;
   }
 
   return result;
